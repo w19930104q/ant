@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"time"
 
 	"github.com/yields/ant/internal/normalize"
 	"github.com/yields/ant/internal/robots"
@@ -32,7 +33,10 @@ type EngineConfig struct {
 
 	// Queue is the URL queue to use.
 	//
-	// If nil, the default in-memory queue is used.
+	// If nil, the default in-memory queue is used. The default
+	// queue is reset between consecutive calls to Run, a custom
+	// Queue implementation is used as-is and must support being
+	// reused if the engine is run more than once.
 	Queue Queue
 
 	// Limiter is the rate limiter to use.
@@ -72,24 +76,67 @@ type EngineConfig struct {
 	// at any given time.
 	//
 	// The engine uses a global semaphore to limit the amount
-	// of goroutines started by the workers.
+	// of goroutines started by the workers, across all origins.
 	//
-	// If <= 0, there's no limit.
+	// If <= 0, there's no global limit.
 	Concurrency int
+
+	// MaxConcurrentRequestsPerSite limits the amount of URLs
+	// processed concurrently for any single origin.
+	//
+	// An origin is identified by its scheme, hostname and
+	// effective port, so "http://example.com" and
+	// "http://example.com:8080" are scheduled independently,
+	// while URLs of the same origin share the window. URLs of
+	// different origins may still be processed in parallel.
+	//
+	// If <= 0, there is no per-origin concurrency limit.
+	MaxConcurrentRequestsPerSite int
+
+	// DownloadDelay is the minimum duration between the dispatch
+	// of two URLs of the same origin.
+	//
+	// The delay is scoped per origin, it does not slow down
+	// unrelated origins. Fetcher retries and HTTP redirects of
+	// a URL are attributed to the origin that dispatched it.
+	//
+	// If zero, no delay is applied.
+	DownloadDelay time.Duration
+
+	// OriginIdleTimeout is the duration after which an origin
+	// with no queued and no in-flight URLs has its scheduling
+	// state garbage-collected.
+	//
+	// If <= 0, a default of 5 minutes is used.
+	OriginIdleTimeout time.Duration
 }
 
 // Engine implements web crawler engine.
 type Engine struct {
-	deduper  Deduper
-	scraper  Scraper
-	fetcher  *Fetcher
-	queue    Queue
-	matcher  Matcher
-	limiter  Limiter
-	robots   *robots.Cache
+	deduper Deduper
+	scraper Scraper
+	fetcher *Fetcher
+	queue   Queue
+	matcher Matcher
+	limiter Limiter
+	robots  *robots.Cache
+
 	impolite bool
 	workers  int
 	sema     *semaphore.Weighted
+	sched    *scheduler
+}
+
+// resettableQueue is implemented by queues that can be prepared
+// for a new Engine.Run.
+type resettableQueue interface {
+	reset()
+}
+
+// discardHookQueue is implemented by queues that report URLs
+// discarded by a Close happening before the URL was dequeued.
+type discardHookQueue interface {
+	setDiscardHook(func(*URL))
 }
 
 // NewEngine returns a new engine.
@@ -119,7 +166,7 @@ func NewEngine(c EngineConfig) (*Engine, error) {
 		sema = semaphore.NewWeighted(n)
 	}
 
-	return &Engine{
+	eng := &Engine{
 		scraper:  c.Scraper,
 		deduper:  c.Deduper,
 		fetcher:  c.Fetcher,
@@ -130,38 +177,109 @@ func NewEngine(c EngineConfig) (*Engine, error) {
 		impolite: c.Impolite,
 		workers:  c.Workers,
 		sema:     sema,
-	}, nil
+		sched: newScheduler(
+			c.MaxConcurrentRequestsPerSite,
+			c.DownloadDelay,
+			c.OriginIdleTimeout,
+			sema,
+		),
+	}
+
+	// URLs discarded by a cancellation-driven Close never reach
+	// Acquire, settle their per-origin counters through Discard.
+	if hq, ok := eng.queue.(discardHookQueue); ok {
+		hq.setDiscardHook(func(u *URL) {
+			eng.sched.Discard(u)
+		})
+	}
+
+	return eng, nil
 }
 
 // Run runs the engine with the given start urls.
 func (eng *Engine) Run(ctx context.Context, urls ...string) error {
+	// Prepare the engine for a fresh run. The scheduler drops the
+	// previous run's origins and the engine-owned default queue is
+	// reset so the same engine can be reused.
+	eng.reset()
+
 	var eg, subctx = errgroup.WithContext(ctx)
 
 	// Enqueue initial URLs.
 	if err := eng.Enqueue(ctx, urls...); err != nil {
+		// Nothing was dispatched, close the reset queue so any
+		// worker that might observe it shuts down immediately.
+		_ = eng.queue.Close(ctx)
 		return fmt.Errorf("ant: enqueue - %w", err)
 	}
 
 	// Spawn workers.
 	for i := 0; i < eng.workers; i++ {
 		eg.Go(func() error {
-			defer eng.queue.Close(ctx)
 			return eng.run(subctx)
 		})
 	}
 
-	// Wait until all URLs are handled.
-	eng.queue.Wait()
+	// Wait until all URLs are handled, or until the context is
+	// canceled. On cancellation the queue is closed: URLs that
+	// were never dispatched are discarded and their queue
+	// counters settled, so Wait unblocks without waiting for work
+	// that must never run. In-flight URLs are still awaited below
+	// through the error group.
+	waitDone := make(chan struct{})
+	go func() {
+		eng.queue.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		if err := eng.queue.Close(ctx); err != nil {
+			return err
+		}
+		<-waitDone
+	}
+
 	if err := eng.queue.Close(ctx); err != nil {
 		return err
 	}
 
-	// Wait until all workers shutdown.
+	// Wait until all workers shutdown, including in-flight URLs.
 	if err := eg.Wait(); err != nil {
 		return fmt.Errorf("ant: run - %w", err)
 	}
 
+	// A canceled or timed-out root context always surfaces, even
+	// when the in-flight URLs happened to finish successfully.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("ant: run - %w", err)
+	}
+
 	return nil
+}
+
+// Close releases the engine's background resources, notably the
+// goroutine that garbage-collects idle origins.
+//
+// It does not close the configured Queue, which is user-owned when
+// supplied through EngineConfig. It is safe to call Close more than
+// once and safe to reuse the engine with Run afterwards.
+func (eng *Engine) Close() error {
+	eng.sched.stop()
+	return nil
+}
+
+// reset prepares the engine for a new run.
+//
+// Only the scheduler's origin state and the engine-owned default
+// queue are reset; a user-provided Deduper or Queue keeps its
+// state and semantics across runs.
+func (eng *Engine) reset() {
+	eng.sched.reset()
+	if rq, ok := eng.queue.(resettableQueue); ok {
+		rq.reset()
+	}
 }
 
 // Enqueue enqueues the given set of URLs.
@@ -207,45 +325,55 @@ func (eng *Engine) enqueue(ctx context.Context, batch URLs) error {
 		return err
 	}
 
+	// Account the de-duplicated URLs that actually reached the
+	// queue against their origin's scheduling counters.
+	eng.sched.enqueue(next)
+
 	return nil
 }
 
 // Run runs a single crawl worker.
 //
-// The worker is in charge of fetching a url from
-// the queue, creating a page and then calling the scraper.
+// The worker dequeues a URL and hands it to the origin scheduler.
+// When the context is canceled the scheduler stops dispatching and
+// the worker returns as soon as its in-flight URLs finish.
 func (eng *Engine) run(ctx context.Context) error {
 	eg, subctx := errgroup.WithContext(ctx)
 	for {
 		url, err := eng.queue.Dequeue(ctx)
 
-		if errors.Is(err, io.EOF) ||
-			errors.Is(err, context.Canceled) {
+		if errors.Is(err, io.EOF) {
+			return eg.Wait()
+		}
+		if errors.Is(err, context.Canceled) {
 			return eg.Wait()
 		}
 		if err != nil {
 			return err
 		}
 
-		if eng.sema != nil {
-			if err := eng.sema.Acquire(ctx, 1); err != nil {
-				return err
-			}
+		// Acquire the origin's concurrency window and download
+		// delay. On cancel the URL is not dispatched, it is
+		// discarded and the worker stops pulling.
+		if err := eng.sched.Acquire(ctx, url); err != nil {
+			eng.sched.Discard(url)
+			_ = eng.queue.Done(ctx, url)
+			return eg.Wait()
 		}
 
 		eg.Go(func() error {
-			if eng.sema != nil {
-				defer eng.sema.Release(1)
-			}
-			return eng.process(subctx, url)
+			defer eng.sched.Release(url)
+			defer eng.queue.Done(subctx, url)
+
+			err := eng.process(subctx, url)
+			eng.sched.Done(url, err)
+			return err
 		})
 	}
 }
 
 // Process processes a single url.
 func (eng *Engine) process(ctx context.Context, url *URL) error {
-	defer eng.queue.Done(ctx, url)
-
 	// Check robots.txt.
 	if !eng.impolite {
 		allowed, err := eng.robots.Allowed(ctx, robots.Request{
@@ -346,4 +474,38 @@ func (eng *Engine) matches(urls URLs) URLs {
 		return ret
 	}
 	return urls
+}
+
+// OriginKey returns the stable origin key used to schedule the
+// given URL, built from its scheme, hostname and effective port.
+//
+// It returns an error if the raw URL cannot be parsed.
+func OriginKey(rawurl string) (string, error) {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return "", err
+	}
+	return originKey(u), nil
+}
+
+// Origins returns the origin keys currently tracked by the engine.
+//
+// The returned slice is a snapshot, origins that have been idle
+// for longer than OriginIdleTimeout may have been reaped.
+func (eng *Engine) Origins() []string {
+	return eng.sched.Origins()
+}
+
+// OriginStats returns the scheduling counters of the given origin
+// key, use OriginKey to compute the key of a URL.
+//
+// The boolean is false if the origin is not (or no longer) known.
+func (eng *Engine) OriginStats(key string) (OriginStats, bool) {
+	return eng.sched.OriginStats(key)
+}
+
+// Stats returns a snapshot of the per-origin scheduling counters,
+// keyed by origin key.
+func (eng *Engine) Stats() map[string]OriginStats {
+	return eng.sched.Stats()
 }

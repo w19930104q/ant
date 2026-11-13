@@ -54,6 +54,10 @@ type memoryQueue struct {
 	cond    *sync.Cond
 	stopped bool
 	wg      *sync.WaitGroup
+
+	// onDiscard is called, outside the queue lock, with every URL
+	// that is discarded by Close before it could be dequeued.
+	onDiscard func(*URL)
 }
 
 // MemoryQueue returns a new memory queue.
@@ -122,10 +126,38 @@ func (mq *memoryQueue) Wait() {
 	mq.wg.Wait()
 }
 
+// reset prepares the queue for a new Engine.Run.
+//
+// It discards any pending URLs and counters from the previous run.
+func (mq *memoryQueue) reset() {
+	mq.cond.L.Lock()
+	defer mq.cond.L.Unlock()
+
+	mq.pending = make(URLs, 0)
+	mq.stopped = false
+	mq.wg = &sync.WaitGroup{}
+	mq.cond.Broadcast()
+}
+
+// setDiscardHook registers a callback invoked for every URL that
+// Close discards before it could be dequeued.
+func (mq *memoryQueue) setDiscardHook(fn func(*URL)) {
+	mq.cond.L.Lock()
+	defer mq.cond.L.Unlock()
+	mq.onDiscard = fn
+}
+
 // Close implementation.
 func (mq *memoryQueue) Close(_ context.Context) error {
 	mq.cond.L.Lock()
-	defer mq.cond.L.Unlock()
+
+	if mq.stopped {
+		mq.cond.L.Unlock()
+		return nil
+	}
+
+	discarded := append(URLs(nil), mq.pending...)
+	onDiscard := mq.onDiscard
 
 	for range mq.pending {
 		mq.wg.Done()
@@ -134,5 +166,14 @@ func (mq *memoryQueue) Close(_ context.Context) error {
 	mq.stopped = true
 	mq.pending = mq.pending[:0]
 	mq.cond.Broadcast()
+	mq.cond.L.Unlock()
+
+	// Invoke the callback without holding the queue lock to avoid
+	// re-entrant locking through the scheduler.
+	if onDiscard != nil {
+		for _, u := range discarded {
+			onDiscard(u)
+		}
+	}
 	return nil
 }

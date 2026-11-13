@@ -114,6 +114,34 @@
 
 <br>
 
+#### Per-origin scheduling
+
+  Limits that must apply to a whole site are scheduled per origin, where an
+  origin is the combination of the scheme, the hostname and the effective port.
+  For example `http://example.com` and `http://example.com:80` share an origin
+  (the implied default port is filled in), while `http://example.com:8080` and
+  `https://example.com` each get their own.
+
+  ```go
+  eng, err := ant.NewEngine(ant.EngineConfig{
+    Scraper:                      scraper,
+    MaxConcurrentRequestsPerSite: 2,                       // at most 2 concurrent requests per origin.
+    DownloadDelay:                500 * time.Millisecond,  // half a second between two same-origin requests.
+    OriginIdleTimeout:            5 * time.Minute,         // reclaim idle origin state after this duration.
+  })
+  ```
+
+  URLs of the same origin share a concurrency window and a download delay, while
+  URLs of different origins keep running in parallel. Fetcher retries and HTTP
+  redirects stay attributed to the origin that dispatched the URL. Cancelling
+  the run's context stops further dispatch and lets the in-flight requests
+  finish before `Run` returns.
+
+  `Engine.Stats`, `Engine.OriginStats` and `Engine.Origins` expose stable
+  per-origin counters for queued, in-flight, successful and failed URLs.
+
+<br>
+
 #### Matchers
 
   Another powerful interface is `ant.Matcher` which allows you to define URL

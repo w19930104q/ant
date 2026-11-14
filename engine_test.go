@@ -127,6 +127,61 @@ func TestEngine(t *testing.T) {
 		assert.EqualError(err, `ant: enqueue - ant: dedupe - boom`)
 	})
 
+	t.Run("dedupe different spellings of the same resource", func(t *testing.T) {
+		var ctx = context.Background()
+		var assert = require.New(t)
+		var visitor = &visitor{}
+		var eng = setup(t, visitor)
+		var srv = server(t, "example.com")
+
+		err := eng.Run(ctx,
+			srv.URL,
+			srv.URL+"/?",
+			srv.URL+"/.",
+			srv.URL+"/#fragment",
+		)
+
+		assert.NoError(err)
+
+		var root int
+		for _, p := range visitor.paths {
+			if p == "/" {
+				root++
+			}
+		}
+		assert.Equal(1, root, "expected / to be fetched once, got %v", visitor.paths)
+	})
+
+	t.Run("enqueue normalizes URLs before dedupe", func(t *testing.T) {
+		var ctx = context.Background()
+		var assert = require.New(t)
+		var rec = &recordDeduper{}
+		var eng = setup(t, &visitor{})
+
+		eng.deduper = rec
+
+		err := eng.Enqueue(ctx,
+			"http://EXAMPLE.com:80/a/b?",
+			"http://example.com/a/./b",
+			"http://example.com/%61/%62",
+			"http://example.com/a/b#fragment",
+			"http://example.com/a%2Fb",
+			"https://example.com/a/b",
+			"http://example.com:8080/a/b",
+		)
+
+		assert.NoError(err)
+		assert.Equal([]string{
+			"http://example.com/a/b",
+			"http://example.com/a/b",
+			"http://example.com/a/b",
+			"http://example.com/a/b",
+			"http://example.com/a%2Fb",
+			"https://example.com/a/b",
+			"http://example.com:8080/a/b",
+		}, rec.keys)
+	})
+
 	t.Run("limit error", func(t *testing.T) {
 		var ctx = context.Background()
 		var assert = require.New(t)
@@ -257,4 +312,17 @@ type dedupeError struct{}
 
 func (d dedupeError) Dedupe(ctx context.Context, urls URLs) (URLs, error) {
 	return nil, errors.New("boom")
+}
+
+// RecordDeduper records the keys of all URLs it receives.
+type recordDeduper struct {
+	keys []string
+}
+
+// Dedupe implementation.
+func (d *recordDeduper) Dedupe(ctx context.Context, urls URLs) (URLs, error) {
+	for _, u := range urls {
+		d.keys = append(d.keys, u.String())
+	}
+	return urls, nil
 }

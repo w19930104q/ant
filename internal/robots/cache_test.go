@@ -98,6 +98,57 @@ func TestCache(t *testing.T) {
 	})
 }
 
+func TestKeyof(t *testing.T) {
+	t.Run("same origin, same key", func(t *testing.T) {
+		var groups = [][]string{
+			{
+				"http://example.com/",
+				"HTTP://EXAMPLE.COM/",
+				"http://example.com:80/foo/bar",
+				"http://example.com/?a=1#frag",
+			},
+			{
+				"https://example.com/",
+				"HTTPS://EXAMPLE.COM:443/foo",
+			},
+		}
+
+		for _, group := range groups {
+			var keys = make(map[string]int)
+
+			for _, rawurl := range group {
+				u, err := url.Parse(rawurl)
+				require.NoError(t, err)
+				keys[keyof(u)]++
+			}
+
+			require.Len(t, keys, 1, "group %v produced %v", group, keys)
+		}
+	})
+
+	t.Run("different origins, different keys", func(t *testing.T) {
+		var urls = []string{
+			"http://example.com/",
+			"https://example.com/",
+			"http://example.com:8080/",
+			"http://other.com/",
+		}
+
+		var keys = make(map[string]string)
+
+		for _, rawurl := range urls {
+			u, err := url.Parse(rawurl)
+			require.NoError(t, err)
+
+			key := keyof(u)
+			if prev, ok := keys[key]; ok {
+				t.Fatalf("urls %q and %q produced the same key %q", prev, rawurl, key)
+			}
+			keys[key] = rawurl
+		}
+	})
+}
+
 func BenchmarkCache(b *testing.B) {
 	b.Run("allowed", func(b *testing.B) {
 		var ctx = context.Background()

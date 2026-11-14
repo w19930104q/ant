@@ -13,6 +13,7 @@ import (
 
 	"github.com/segmentio/agecache"
 	"github.com/temoto/robotstxt"
+	"github.com/yields/ant/internal/normalize"
 )
 
 // Request represents a request.
@@ -139,12 +140,14 @@ func (c *Cache) Wait(ctx context.Context, req Request) error {
 //
 // Note that there's a logical race, the method may send multiple requests
 // for the same robots.txt URL, this is intentional to speed up lookups.
-func (c *Cache) lookup(ctx context.Context, url *url.URL) (*Host, error) {
-	if v, ok := c.lru.Get(url.Host); ok {
+func (c *Cache) lookup(ctx context.Context, u *url.URL) (*Host, error) {
+	var key = keyof(u)
+
+	if v, ok := c.lru.Get(key); ok {
 		return v.(*Host), nil
 	}
 
-	rawurl := url.Scheme + "://" + url.Host + "/robots.txt"
+	rawurl := key + "/robots.txt"
 	req, err := http.NewRequestWithContext(ctx, "GET", rawurl, nil)
 	if err != nil {
 		return nil, fmt.Errorf("robots: new request - %w", err)
@@ -158,7 +161,7 @@ func (c *Cache) lookup(ctx context.Context, url *url.URL) (*Host, error) {
 
 	if resp.StatusCode >= 400 {
 		s := &Host{}
-		c.lru.Set(url.Host, s)
+		c.lru.Set(key, s)
 		return s, nil
 	}
 
@@ -168,6 +171,17 @@ func (c *Cache) lookup(ctx context.Context, url *url.URL) (*Host, error) {
 	}
 
 	s := &Host{data: data}
-	c.lru.Set(url.Host, s)
+	c.lru.Set(key, s)
 	return s, nil
+}
+
+// Keyof returns the robots cache key for the given URL.
+//
+// The key is the normalized origin of the URL, this ensures
+// that different spellings of the same origin (letter case,
+// default ports) share a single cache entry, while different
+// origins never do.
+func keyof(u *url.URL) string {
+	n := normalize.URL(&url.URL{Scheme: u.Scheme, Host: u.Host})
+	return n.Scheme + "://" + n.Host
 }

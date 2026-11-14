@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/spaolacci/murmur3"
+	"github.com/yields/ant/internal/normalize"
 )
 
 // Merge merges b headers into a.
@@ -27,9 +28,16 @@ func merge(a http.Header, b http.Header) {
 }
 
 // Keyof returns a cache key of req.
+//
+// The request URL is normalized before it is hashed, this
+// ensures that different spellings of the same resource
+// (letter case, default ports, dot segments, percent
+// encoding, ...) share a single cache entry, while
+// different resources never do.
 func keyof(req *http.Request) uint64 {
+	u := *req.URL
 	return murmur3.Sum64([]byte(
-		req.Method + ":" + req.URL.String(),
+		req.Method + ":" + normalize.URL(&u).String(),
 	))
 }
 
